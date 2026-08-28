@@ -158,6 +158,14 @@ interface ApsRequest {
     resolve: (value: any) => void;
     reject: (value: Error) => void;
     ts: number; // time sent
+    /**
+     * Absolute time (ms since epoch) by which this request must be settled.
+     *
+     * Fixed when the request is enqueued, so a request can never outlive its budget no matter how often
+     * it moves between apsQueue and apsBusyQueue. Unlike `ts`, which is updated on every send attempt,
+     * this is never mutated.
+     */
+    deadline: number;
 }
 
 interface WaitForDataRequest {
@@ -236,7 +244,7 @@ interface ApsDataRequest {
     asduPayload: Buffer;
     txOptions: number;
     radius: number;
-    timeout: number; // seconds
+    timeout: number; // milliseconds
 }
 
 type Command = Buffer | number | bigint;

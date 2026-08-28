@@ -214,7 +214,9 @@ function parseApsConfirmResponse(view: DataView): DataStateResponse | null {
         req.resolve(confirmStatus);
     } else {
         // if the request failed check if we can resend with APS ACK enabled
-        const hasTimeLeft = Date.now() - req.ts < req.request.timeout;
+        // `req.ts` is the time of the last send attempt, so comparing against it let a resent request
+        // outlive its budget. `req.deadline` is fixed at enqueue time.
+        const hasTimeLeft = Date.now() < req.deadline;
 
         if (req.request.txOptions === 0 && hasTimeLeft && req.request.destAddrMode === ApsAddressMode.Nwk) {
             req.request.txOptions = 0x04;

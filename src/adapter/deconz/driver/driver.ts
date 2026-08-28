@@ -35,6 +35,18 @@ export const busyQueue: Array<Request> = [];
 export const apsQueue: Array<ApsRequest> = [];
 export const apsBusyQueue: Array<ApsRequest> = [];
 
+/**
+ * Lower bound for the driver's own deadline, independent of the caller's timeout.
+ *
+ * The driver deadline exists to guarantee that an APS request always settles. It is not there to enforce
+ * the caller's SLA - deconzAdapter's waitForData() already does that, using the very same request.timeout.
+ * Setting the driver deadline equal to the caller's budget makes the driver preempt the layer above it: a
+ * slow route discovery can consume the entire budget, and the APS-ACK resend issued from frameParser is
+ * then killed before it can complete, even in the cases where that retry would have succeeded. Keep the
+ * safety net well clear of the caller's own timeout.
+ */
+const APS_MIN_DEADLINE = 30000;
+
 const DRIVER_EVENT = Symbol("drv_ev");
 
 const DEV_STATUS_NET_STATE_MASK = 0x03;
@@ -1301,7 +1313,11 @@ class Driver extends events.EventEmitter {
             //logger.debug(`push enqueue send data request to apsQueue. seqNr: ${seqNumber}`, NS);
             const ts = Date.now();
             const commandId = FirmwareCommand.ApsDataRequest;
-            const req: ApsRequest = {commandId, seqNumber, request, resolve, reject, ts};
+            // ApsDataRequest.timeout is in milliseconds; fall back to the maximum if a caller omits it.
+            const timeout = request.timeout > 0 ? request.timeout : PARAM.PARAM.APS.MAX_SEND_TIMEOUT;
+            // Never let the driver's safety net expire before the caller's own timeout; see APS_MIN_DEADLINE.
+            const driverTimeout = Math.max(timeout, APS_MIN_DEADLINE);
+            const req: ApsRequest = {commandId, seqNumber, request, resolve, reject, ts, deadline: ts + driverTimeout};
             apsQueue.push(req);
             this.emitStateEvent(DriverEvent.EnqueuedApsDataRequest, req.seqNumber);
         });
@@ -1403,16 +1419,23 @@ class Driver extends events.EventEmitter {
         );
     }
 
+    /**
+     * Reject requests that were handed to the firmware but never produced an APS-DATA.confirm.
+     *
+     * NOTE: this used to compute `req.request.timeout * 1000`, treating ApsDataRequest.timeout as
+     * seconds. All callers pass milliseconds - deconzAdapter.ts hands the very same value to
+     * waitForData(), which compares it against milliseconds. The extra factor 1000 stretched a 10s
+     * timeout to ~2.8 hours and a 60s timeout to ~16.7 hours, so in practice this timeout never fired at
+     * all: a lost APS-DATA.confirm left the caller awaiting indefinitely. It also let stale entries pile
+     * up in apsBusyQueue, where confirms are matched on the 1..255 request id alone - long enough for
+     * that id to wrap around and confirm the wrong request.
+     */
     private processApsBusyQueueTimeouts(): void {
         let i = apsBusyQueue.length;
         while (i--) {
             const req = apsBusyQueue[i];
-            const now = Date.now();
-            let timeout = 60000;
-            if (req.request != null && req.request.timeout != null) {
-                timeout = req.request.timeout * 1000; // seconds * 1000 = milliseconds
-            }
-            if (now - req.ts > timeout) {
+
+            if (Date.now() >= req.deadline) {
                 //remove from busyQueue
                 apsBusyQueue.splice(i, 1);
                 req.reject(new Error(`Timeout for APS-DATA.request, seq: ${req.seqNumber}`));
