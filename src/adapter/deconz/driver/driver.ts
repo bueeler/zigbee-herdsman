@@ -802,6 +802,7 @@ class Driver extends events.EventEmitter {
             ) {
                 this.handleFirmwareEvent(event, data);
                 this.processBusyQueueTimeouts();
+                this.processApsQueueTimeouts();
                 this.processApsBusyQueueTimeouts();
             }
 
@@ -1439,6 +1440,29 @@ class Driver extends events.EventEmitter {
                 //remove from busyQueue
                 apsBusyQueue.splice(i, 1);
                 req.reject(new Error(`Timeout for APS-DATA.request, seq: ${req.seqNumber}`));
+            }
+        }
+    }
+
+    /**
+     * Reject requests that are still waiting to be handed to the firmware past their deadline.
+     *
+     * apsQueue had no timeout scan at all, only apsBusyQueue was ever swept. A request that never made
+     * it out of apsQueue therefore sat there unsettled forever with no diagnostic of any kind - for
+     * example when the driver leaves DriverState.Connected so handleApsQueueOnDeviceState() stops
+     * draining the queue, or when the APS-ACK resend path in frameParser.ts pushes an entry back onto
+     * apsQueue. Together with the apsBusyQueue scan this guarantees that every APS request settles,
+     * whichever queue it happens to sit in.
+     */
+    private processApsQueueTimeouts(): void {
+        let i = apsQueue.length;
+        while (i--) {
+            const req = apsQueue[i];
+
+            if (Date.now() >= req.deadline) {
+                apsQueue.splice(i, 1);
+                logger.debug(`Timeout for queued APS-DATA.request, seq: ${req.seqNumber}`, NS);
+                req.reject(new Error(`Timeout for APS-DATA.request while queued, seq: ${req.seqNumber}`));
             }
         }
     }
