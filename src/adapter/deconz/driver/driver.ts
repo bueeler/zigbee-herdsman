@@ -35,6 +35,9 @@ export const busyQueue: Array<Request> = [];
 export const apsQueue: Array<ApsRequest> = [];
 export const apsBusyQueue: Array<ApsRequest> = [];
 
+/** How often a single APS request may fail to be handed to the firmware before it is rejected. */
+const APS_MAX_SEND_ATTEMPTS = 3;
+
 /**
  * Lower bound for the driver's own deadline, independent of the caller's timeout.
  *
@@ -1318,7 +1321,7 @@ class Driver extends events.EventEmitter {
             const timeout = request.timeout > 0 ? request.timeout : PARAM.PARAM.APS.MAX_SEND_TIMEOUT;
             // Never let the driver's safety net expire before the caller's own timeout; see APS_MIN_DEADLINE.
             const driverTimeout = Math.max(timeout, APS_MIN_DEADLINE);
-            const req: ApsRequest = {commandId, seqNumber, request, resolve, reject, ts, deadline: ts + driverTimeout};
+            const req: ApsRequest = {commandId, seqNumber, request, resolve, reject, ts, deadline: ts + driverTimeout, sendAttempts: 0};
             apsQueue.push(req);
             this.emitStateEvent(DriverEvent.EnqueuedApsDataRequest, req.seqNumber);
         });
@@ -1338,20 +1341,37 @@ class Driver extends events.EventEmitter {
             return;
         }
 
-        if (req.request) {
-            req.ts = Date.now();
+        // A request that is neither an ApsDataRequest nor carries a payload used to be dropped here,
+        // after it had already been shifted off apsQueue: the throw was swallowed by handleStateEvent's
+        // catch-all and the falsy req.request branch simply fell through. The request then sat in neither
+        // queue with its promise pending forever. Always settle it instead of dropping it.
+        if (req.commandId !== FirmwareCommand.ApsDataRequest || !req.request) {
+            req.reject(new Error(`Unexpected request in apsQueue, cmd: ${req.commandId}, seq: ${req.seqNumber}`));
+            return;
+        }
 
-            if (req.commandId !== FirmwareCommand.ApsDataRequest) {
-                // should never happen
-                throw new Error("process APS queue - unknown command id");
+        req.ts = Date.now();
+        req.sendAttempts++;
+
+        try {
+            this.sendEnqueueApsDataRequest(req.request, req.seqNumber);
+            apsBusyQueue.push(req);
+        } catch (error) {
+            // This used to be an unconditional apsQueue.unshift(req). sendRequest() throws for permanent,
+            // payload dependent conditions as well as transient ones - most notably "send unexpected long
+            // slip frame" once the SLIP escaped frame reaches 256 bytes. Such a request went straight back
+            // to the *head* of apsQueue, failed identically on the next attempt and looped forever. It
+            // never reached apsBusyQueue, so no timeout ever applied to it, and every APS request queued
+            // behind it was blocked for the lifetime of the process. Bound the retries and settle instead.
+            const message = error instanceof Error ? error.message : String(error);
+
+            if (req.sendAttempts >= APS_MAX_SEND_ATTEMPTS || Date.now() >= req.deadline) {
+                logger.error(`Failed to send APS-DATA.request seq: ${req.seqNumber}, reason: ${message}`, NS);
+                req.reject(new Error(`Failed to send APS-DATA.request seq: ${req.seqNumber} after ${req.sendAttempts} attempt(s): ${message}`));
+                return;
             }
 
-            try {
-                this.sendEnqueueApsDataRequest(req.request, req.seqNumber);
-                apsBusyQueue.push(req);
-            } catch (_) {
-                apsQueue.unshift(req);
-            }
+            apsQueue.unshift(req);
         }
     }
 

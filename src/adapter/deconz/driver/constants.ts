@@ -166,6 +166,8 @@ interface ApsRequest {
      * this is never mutated.
      */
     deadline: number;
+    /** Number of times the driver tried to hand this request's frame to the firmware. */
+    sendAttempts: number;
 }
 
 interface WaitForDataRequest {
