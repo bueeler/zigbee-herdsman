@@ -39,6 +39,17 @@ export const apsBusyQueue: Array<ApsRequest> = [];
 const APS_MAX_SEND_ATTEMPTS = 3;
 
 /**
+ * How long the firmware may send nothing at all, while connected, before the connection is considered dead.
+ *
+ * In the Connected state the driver polls the device state continuously, so a working firmware produces a
+ * frame every few hundred milliseconds. Nothing arriving for this long means the adapter has stopped
+ * answering the serial link entirely, which has been observed to persist for hours: every APS request times
+ * out, every device eventually appears offline, and the driver quietly retries forever because no state in
+ * the Connected branch escalates. Reopening the port is the only recovery available to us.
+ */
+const FIRMWARE_UNRESPONSIVE_TIMEOUT = 20000;
+
+/**
  * Lower bound for the driver's own deadline, independent of the caller's timeout.
  *
  * The driver deadline exists to guarantee that an APS request always settles. It is not there to enforce
@@ -108,7 +119,6 @@ class Driver extends events.EventEmitter {
     // biome-ignore lint/correctness/noUnusedPrivateClassMembers: ignore
     private timeoutCounter = 0;
     private watchdogTriggeredTime = 0;
-    // biome-ignore lint/correctness/noUnusedPrivateClassMembers: ignore
     private lastFirmwareRxTime = 0;
     // biome-ignore lint/correctness/noUnusedPrivateClassMembers: ignore
     private tickTimer: NodeJS.Timeout;
@@ -277,6 +287,16 @@ class Driver extends events.EventEmitter {
         this.emit(DRIVER_EVENT, event, data);
     }
 
+    /**
+     * True when the firmware has gone silent while the driver believes it is connected.
+     *
+     * `lastFirmwareRxTime` is 0 until the first frame arrives, so a connection that has never produced one
+     * is left to the existing connect/configure timeouts rather than being cut short here.
+     */
+    private isFirmwareUnresponsive(): boolean {
+        return this.lastFirmwareRxTime !== 0 && Date.now() - this.lastFirmwareRxTime > FIRMWARE_UNRESPONSIVE_TIMEOUT;
+    }
+
     private needWatchdogReset(): boolean {
         const now = Date.now();
         if (300 * 1000 < now - this.watchdogTriggeredTime) {
@@ -340,6 +360,13 @@ class Driver extends events.EventEmitter {
         if (event === DriverEvent.DeviceStateUpdated) {
             this.handleApsQueueOnDeviceState();
         } else if (event === DriverEvent.Tick) {
+            if (this.isFirmwareUnresponsive()) {
+                logger.error(`Firmware stopped responding ${Date.now() - this.lastFirmwareRxTime} ms ago, closing and reconnecting the port`, NS);
+                this.driverStateStart = Date.now();
+                this.driverState = DriverState.CloseAndRestart;
+                return;
+            }
+
             if (this.needWatchdogReset()) {
                 this.resetWatchdog().catch(() => {});
             }
